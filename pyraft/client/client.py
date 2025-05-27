@@ -99,7 +99,7 @@ class RaftClient:
         
         raise TimeoutError("Failed to send command after max retries")
     
-    async def read(self, command: Dict[str, Any], linearizable: bool = True) -> Dict[str, Any]:
+    async def read(self, command: Dict[str, Any], linearizable: bool = True, allow_stale: bool = False) -> Dict[str, Any]:
         """
         Send a read command to the Raft cluster.
         
@@ -110,6 +110,7 @@ class RaftClient:
         Args:
             command: The read command to send.
             linearizable: Whether to use linearizable reads (stronger consistency but slower).
+            allow_stale: Whether to allow stale reads during network partitions.
             
         Returns:
             The response from the leader.
@@ -124,14 +125,17 @@ class RaftClient:
                         read_command = {
                             **command,
                             'linearizable': True,
-                            'min_index': self.last_write_index
+                            'min_index': self.last_write_index,
+                            'allow_stale': allow_stale
                         }
                     else:
-                        read_command = command
+                        read_command = {**command, 'allow_stale': allow_stale}
                     
                     response = await self._send_to_node(self.leader_id, read_command, is_write=False)
                     
                     if response.get('success', False):
+                        if response.get('stale'):
+                            self.logger.warning(f"Received stale read response: {response.get('warning')}")
                         return response
                     
                     if response.get('error') == 'not_leader':
@@ -140,7 +144,21 @@ class RaftClient:
                 if not self.leader_id:
                     await self._find_leader()
                 
-                if not self.leader_id:
+                if not self.leader_id and allow_stale:
+                    self.logger.warning("No leader found, attempting stale read from any available node")
+                    node_ids = list(self.cluster_config.keys())
+                    random.shuffle(node_ids)
+                    
+                    for node_id in node_ids:
+                        stale_command = {**command, 'allow_stale': True, 'linearizable': False}
+                        response = await self._send_to_node(node_id, stale_command, is_write=False)
+                        
+                        if response.get('success', False):
+                            if response.get('stale'):
+                                self.logger.warning(f"Served stale read from {node_id}: {response.get('warning')}")
+                            return response
+                
+                if not self.leader_id and not allow_stale:
                     node_ids = list(self.cluster_config.keys())
                     random.shuffle(node_ids)
                     

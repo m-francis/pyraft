@@ -12,8 +12,47 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 
 from pyraft.client.client import RaftClient, RaftCounter
 
+class CounterWithStaleReads(RaftCounter):
+    """
+    Extended RaftCounter with support for stale reads during partitions.
+    """
+    
+    async def get_with_stale_option(self, allow_stale: bool = False) -> int:
+        """
+        Get the current value of the counter with optional stale read support.
+        
+        Args:
+            allow_stale: Whether to allow stale reads during partitions.
+        
+        Returns:
+            The current value of the counter.
+            
+        Raises:
+            TimeoutError: If the request times out.
+        """
+        command = {
+            'action': 'get',
+            'key': self.counter_key
+        }
+        
+        response = await self.client.read(command, allow_stale=allow_stale)
+        
+        if not response.get('success', False):
+            raise RuntimeError(f"Failed to get counter value: {response.get('error')}")
+        
+        if response.get('stale'):
+            logger = logging.getLogger("raft.client")
+            logger.warning(f"Stale read detected: {response.get('warning')}")
+            logger.warning(f"Partition state: {response.get('partition_state')}")
+        
+        result = response.get('result')
+        if result is None:
+            return 0
+            
+        return result
 
-async def run_client(config_path, counter_key='counter', num_operations=5, delay=1.0):
+
+async def run_client(config_path, counter_key='counter', num_operations=5, delay=1.0, test_stale_reads=False):
     """
     Run a client that interacts with a Raft cluster.
     
@@ -22,6 +61,7 @@ async def run_client(config_path, counter_key='counter', num_operations=5, delay
         counter_key: The key to use for the counter in the state machine.
         num_operations: Number of increment operations to perform.
         delay: Delay between operations in seconds.
+        test_stale_reads: Whether to test stale reads during partitions.
     """
     logging.basicConfig(
         level=logging.DEBUG,  # Changed to DEBUG for more detailed logs
@@ -50,7 +90,7 @@ async def run_client(config_path, counter_key='counter', num_operations=5, delay
         max_retries=10      # Increased max retries
     )
     
-    counter = RaftCounter(client, counter_key)
+    counter = CounterWithStaleReads(client, counter_key)
     
     try:
         logger.info("Attempting to find leader...")
@@ -59,6 +99,23 @@ async def run_client(config_path, counter_key='counter', num_operations=5, delay
             logger.info(f"Found leader: {leader_id}")
         else:
             logger.warning("No leader found, will try operations anyway")
+            
+        if test_stale_reads:
+            logger.info("Testing stale reads during partitions...")
+            try:
+                normal_value = await counter.get()
+                logger.info(f"Normal read value: {normal_value}")
+                
+                stale_value = await counter.get_with_stale_option(allow_stale=True)
+                logger.info(f"Stale-allowed read value: {stale_value}")
+                
+                if normal_value == stale_value:
+                    logger.info("Stale read test: values match (no partition detected)")
+                else:
+                    logger.warning(f"Stale read test: values differ! Normal: {normal_value}, Stale: {stale_value}")
+            except Exception as e:
+                logger.error(f"Error during stale read test: {e}")
+                logger.error(traceback.format_exc())
         
         initial_value = None
         for retry in range(5):
@@ -134,10 +191,17 @@ def main():
     parser.add_argument('--counter-key', default='counter', help='Key to use for the counter')
     parser.add_argument('--num-operations', type=int, default=5, help='Number of increment operations to perform')
     parser.add_argument('--delay', type=float, default=1.0, help='Delay between operations in seconds')
+    parser.add_argument('--test-stale-reads', action='store_true', help='Test stale reads during partitions')
     
     args = parser.parse_args()
     
-    asyncio.run(run_client(args.config, args.counter_key, args.num_operations, args.delay))
+    asyncio.run(run_client(
+        args.config, 
+        args.counter_key, 
+        args.num_operations, 
+        args.delay,
+        args.test_stale_reads
+    ))
 
 
 if __name__ == '__main__':
