@@ -1,4 +1,3 @@
-from enum import Enum, auto
 from typing import Dict, List, Optional, Set, Tuple, Any, Callable, Awaitable
 import asyncio
 import random
@@ -7,15 +6,9 @@ import logging
 
 from pyraft.core.log import RaftLog
 from pyraft.core.state_machine import StateMachine
-
-
-class NodeState(Enum):
-    """
-    Represents the possible states of a Raft node.
-    """
-    FOLLOWER = auto()
-    CANDIDATE = auto()
-    LEADER = auto()
+from pyraft.core.constants import NodeState
+from pyraft.utils.network_metrics import NetworkMetrics
+from pyraft.utils.partition_detector import PartitionDetector, PartitionState
 
 
 class RaftNode:
@@ -74,6 +67,14 @@ class RaftNode:
         
         self.election_timer = None
         self.heartbeat_timer = None
+        self.partition_check_timer = None
+        
+        self.network_metrics = NetworkMetrics()
+        self.partition_detector = PartitionDetector(len(cluster_config))
+        self.partition_state = PartitionState.CONNECTED
+        
+        self.allow_stale_reads = True
+        self.max_stale_read_age = 30.0  # seconds
         
         self.send_append_entries_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None
         self.send_request_vote_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None
@@ -87,6 +88,7 @@ class RaftNode:
         
         if not test_mode:
             self._reset_election_timer()
+            self._start_partition_check_timer()
     
     def _load_persistent_state(self) -> None:
         """
@@ -123,16 +125,19 @@ class RaftNode:
     
     def _reset_election_timer(self) -> None:
         """
-        Reset the election timeout with a random duration.
+        Reset the election timeout with adaptive duration based on network conditions.
         """
         if self.election_timer:
             self.election_timer.cancel()
-            
-        timeout = random.uniform(self.election_timeout_min, self.election_timeout_max)
+        
+        base_timeout = random.uniform(self.election_timeout_min, self.election_timeout_max)
+        adaptive_timeout = self.network_metrics.get_adaptive_timeout(base_timeout)
+        
+        self.logger.debug(f"Setting election timeout to {adaptive_timeout:.2f}s (base: {base_timeout:.2f}s)")
         
         if not self.test_mode:
             try:
-                self.election_timer = asyncio.create_task(self._election_timeout(timeout))
+                self.election_timer = asyncio.create_task(self._election_timeout(adaptive_timeout))
             except RuntimeError:
                 self.logger.warning("No running event loop, skipping election timer")
     
@@ -274,6 +279,48 @@ class RaftNode:
                 
             await self._send_append_entries(node_id)
     
+    def _start_partition_check_timer(self):
+        """Start periodic partition checking."""
+        if not self.test_mode:
+            try:
+                self.partition_check_timer = asyncio.create_task(self._partition_check_loop())
+            except RuntimeError:
+                self.logger.warning("No running event loop, skipping partition check timer")
+    
+    async def _partition_check_loop(self):
+        """Periodically check for partition conditions."""
+        while True:
+            await asyncio.sleep(5.0)  # Check every 5 seconds
+            
+            if self.state == NodeState.LEADER:
+                old_state = self.partition_state
+                self.partition_state = self.partition_detector.get_partition_state(self.node_id)
+                
+                if old_state != self.partition_state:
+                    self.logger.warning(f"Partition state changed from {old_state.value} to {self.partition_state.value}")
+                
+                if self.partition_detector.should_step_down(self.node_id):
+                    self.logger.warning(f"Stepping down as leader due to partition state: {self.partition_state.value}")
+                    await self._step_down_from_leadership()
+    
+    async def _step_down_from_leadership(self):
+        """Step down from leadership due to partition or other conditions."""
+        if self.state != NodeState.LEADER:
+            return
+        
+        self.logger.warning(f"Node {self.node_id} stepping down from leadership in term {self.current_term}")
+        
+        self.state = NodeState.FOLLOWER
+        self.leader_id = None
+        
+        if self.heartbeat_timer:
+            self.heartbeat_timer.cancel()
+            self.heartbeat_timer = None
+        
+        self._reset_election_timer()
+        
+        self.logger.info(f"Stepped down from leadership, partition state: {self.partition_state.value}")
+    
     async def _send_append_entries(self, node_id: str) -> None:
         """
         Send AppendEntries RPC to a follower.
@@ -306,11 +353,21 @@ class RaftNode:
         }
         
         if self.send_append_entries_callback:
+            start_time = time.time()
             try:
                 response = await self.send_append_entries_callback(node_id, args)
+                
+                rtt = time.time() - start_time
+                self.network_metrics.record_rtt(node_id, rtt)
+                self.network_metrics.record_success(node_id)
+                self.partition_detector.record_success(node_id)
+                
             except Exception as e:
                 self.logger.error(f"Error sending AppendEntries to {node_id}: {e}")
                 response = {'error': 'connection_error'}
+                
+                self.network_metrics.record_failure(node_id)
+                self.partition_detector.record_failure(node_id)
             
             if response:
                 if response.get('term', 0) > self.current_term:
@@ -334,7 +391,6 @@ class RaftNode:
                     self._update_commit_index()
                 else:
                     self.next_index[node_id] = max(1, self.next_index[node_id] - 1)
-                    
                     await self._send_append_entries(node_id)
     
     def _update_commit_index(self) -> None:
@@ -624,10 +680,33 @@ class RaftNode:
                 return {
                     'success': True,
                     'result': result,
-                    'index': self.commit_index
+                    'index': self.commit_index,
+                    'partition_state': self.partition_state.value
                 }
             except Exception as e:
                 self.logger.error(f"Error applying read command: {e}")
+                return {
+                    'success': False,
+                    'error': f'state_machine_error: {str(e)}'
+                }
+        
+        if (self.partition_state != PartitionState.CONNECTED and 
+            self.allow_stale_reads and 
+            command.get('allow_stale', False)):
+            
+            self.logger.warning(f"Serving stale read during partition state: {self.partition_state.value}")
+            try:
+                result = self.state_machine.apply(command)
+                return {
+                    'success': True,
+                    'result': result,
+                    'index': self.commit_index,
+                    'stale': True,
+                    'partition_state': self.partition_state.value,
+                    'warning': f'Read served during partition: {self.partition_state.value}'
+                }
+            except Exception as e:
+                self.logger.error(f"Error applying stale read command: {e}")
                 return {
                     'success': False,
                     'error': f'state_machine_error: {str(e)}'
