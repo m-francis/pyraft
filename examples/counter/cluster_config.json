@@ -1,0 +1,14 @@
+{
+    "node1": {
+        "address": "localhost",
+        "port": 8001
+    },
+    "node2": {
+        "address": "localhost",
+        "port": 8002
+    },
+    "node3": {
+        "address": "localhost",
+        "port": 8003
+    }
+}
