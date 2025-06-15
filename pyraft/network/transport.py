@@ -2,6 +2,10 @@ from abc import ABC, abstractmethod
 from typing import Dict, Any, Callable, Awaitable, Optional, List
 import asyncio
 import logging
+import time
+import random
+
+from pyraft.utils.network_metrics import NetworkMetrics
 
 
 class Transport(ABC):
@@ -95,6 +99,8 @@ class TCPTransport(Transport):
         self.request_vote_handler = request_vote_handler
         self.client_request_handler = client_request_handler
         self.read_request_handler = read_request_handler
+        
+        self.network_metrics = NetworkMetrics()
         
         self.server = None
         self.logger = logging.getLogger(f"raft.transport.{node_id}")
@@ -264,7 +270,7 @@ class TCPTransport(Transport):
     
     async def _send_rpc(self, target_id: str, rpc_type: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Send an RPC to a target node.
+        Send an RPC to a target node with adaptive timeout and metrics tracking.
         
         Args:
             target_id: The ID of the target node.
@@ -285,10 +291,20 @@ class TCPTransport(Transport):
         self.logger.debug(f"Sending {rpc_type} RPC to {target_id} at {target_address}:{target_port}")
         
         max_retries = 3
-        retry_delay = 0.1  # seconds
+        base_retry_delay = 0.1  # seconds
+        base_timeout = 1.0  # seconds
+        
+        adaptive_timeout = self.network_metrics.get_adaptive_timeout(base_timeout, target_id)
+        self.logger.debug(f"Using adaptive timeout of {adaptive_timeout:.2f}s for {target_id}")
         
         for retry in range(max_retries):
+            start_time = time.time()
             try:
+                timeout = adaptive_timeout * (1.5 ** retry)
+                retry_delay = base_retry_delay * (2 ** retry)
+                
+                self.logger.debug(f"Attempt {retry+1}/{max_retries} with timeout {timeout:.2f}s")
+                
                 reader, writer = await asyncio.open_connection(target_address, target_port)
                 
                 import msgpack
@@ -300,11 +316,14 @@ class TCPTransport(Transport):
                 writer.write(msgpack.packb(message, use_bin_type=True))
                 await writer.drain()
                 
-                data = await asyncio.wait_for(reader.read(4096), timeout=1.0)
+                data = await asyncio.wait_for(reader.read(4096), timeout=timeout)
                 if not data:
                     self.logger.warning(f"Received empty response from {target_id}")
                     writer.close()
                     await writer.wait_closed()
+                    
+                    self.network_metrics.record_failure(target_id)
+                    
                     if retry < max_retries - 1:
                         await asyncio.sleep(retry_delay)
                         continue
@@ -315,11 +334,18 @@ class TCPTransport(Transport):
                 writer.close()
                 await writer.wait_closed()
                 
-                self.logger.debug(f"Received response from {target_id}: {response}")
+                rtt = time.time() - start_time
+                self.network_metrics.record_rtt(target_id, rtt)
+                self.network_metrics.record_success(target_id)
+                
+                self.logger.debug(f"Received response from {target_id} in {rtt:.3f}s: {response}")
                 return response
                 
             except asyncio.TimeoutError:
-                self.logger.warning(f"Timeout sending RPC to {target_id} (retry {retry+1}/{max_retries})")
+                self.logger.warning(f"Timeout sending RPC to {target_id} (retry {retry+1}/{max_retries}, timeout: {timeout:.2f}s)")
+                
+                self.network_metrics.record_failure(target_id)
+                
                 if retry < max_retries - 1:
                     await asyncio.sleep(retry_delay)
                     continue
@@ -327,6 +353,9 @@ class TCPTransport(Transport):
                 
             except ConnectionRefusedError:
                 self.logger.warning(f"Connection refused by {target_id} at {target_address}:{target_port} (retry {retry+1}/{max_retries})")
+                
+                self.network_metrics.record_failure(target_id)
+                
                 if retry < max_retries - 1:
                     await asyncio.sleep(retry_delay)
                     continue
@@ -334,6 +363,9 @@ class TCPTransport(Transport):
                 
             except Exception as e:
                 self.logger.error(f"Error sending RPC to {target_id}: {e} (retry {retry+1}/{max_retries})")
+                
+                self.network_metrics.record_failure(target_id)
+                
                 if retry < max_retries - 1:
                     await asyncio.sleep(retry_delay)
                     continue
